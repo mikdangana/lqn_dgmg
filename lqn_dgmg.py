@@ -327,7 +327,7 @@ import torch
 
 
 class GraphEmbed(nn.Module):
-    def __init__(self, node_hidden_size):
+    def __init__(self, node_hidden_size, inputs=[0,0.001], utilizations=[]):
         super(GraphEmbed, self).__init__()
 
         # Setting from the paper
@@ -340,6 +340,9 @@ class GraphEmbed(nn.Module):
         )
         self.node_to_graph = nn.Linear(node_hidden_size,
                                        self.graph_hidden_size)
+        self.arrival_rate = inputs[0]
+        self.R = inputs[1]
+        self.utilizations = utilizations
 
     def forward(self, g):
         if g.number_of_nodes() == 0:
@@ -511,8 +514,10 @@ class AddNode(nn.Module):
         self.log_prob = []
 
     def forward(self, g, action=None):
+        print("forward.graph_embed_fn = " + str(self.graph_op['embed'].arrival_rate))
         graph_embed = self.graph_op['embed'](g)
 
+        print("forward.graph_embed = " + str(graph_embed))
         logit = self.add_node(graph_embed)
         prob = torch.sigmoid(logit)
 
@@ -708,6 +713,74 @@ class DGMG(DGMGSkeleton):
         choose_dest_log_p = torch.cat(self.choose_dest_agent.log_prob).sum()
         return add_node_log_p + add_edge_log_p + choose_dest_log_p
 
+
+#######################################################################################
+# LQN model class 
+# ``````````````````````````
+#
+# We are now ready to have a complete implementation of the model class.
+#
+
+class DGLQN(DGMGSkeleton):
+    def __init__(self, v_max, node_hidden_size,
+                 num_prop_rounds, inputs, utilizations):
+        super(DGLQN, self).__init__(v_max)
+
+        # Graph embedding module
+        self.graph_embed =GraphEmbed(node_hidden_size, inputs, utilizations)
+
+        # Graph propagation module
+        self.graph_prop = GraphProp(num_prop_rounds,
+                                    node_hidden_size)
+
+        # Actions
+        self.add_node_agent = AddNode(
+            self.graph_embed, node_hidden_size)
+        self.add_edge_agent = AddEdge(
+            self.graph_embed, node_hidden_size)
+        self.choose_dest_agent = ChooseDestAndUpdate(
+            self.graph_prop, node_hidden_size)
+
+        # Forward functions
+        self.forward_train = partial(forward_train, self=self)
+        self.forward_inference = partial(forward_inference, self=self)
+
+    @property
+    def action_step(self):
+        old_step_count = self.step_count
+        self.step_count += 1
+
+        return old_step_count
+
+    def prepare_for_train(self):
+        self.step_count = 0
+
+        self.add_node_agent.prepare_training()
+        self.add_edge_agent.prepare_training()
+        self.choose_dest_agent.prepare_training()
+
+    def add_node_and_update(self, a=None):
+        """Decide if to add a new node.
+        If a new node should be added, update the graph."""
+
+        return self.add_node_agent(self.g, a)
+
+    def add_edge_or_not(self, a=None):
+        """Decide if a new edge should be added."""
+
+        return self.add_edge_agent(self.g, a)
+
+    def choose_dest_and_update(self, a=None):
+        """Choose destination and connect it to the latest node.
+        Add edges for both directions and update the graph."""
+
+        self.choose_dest_agent(self.g, a)
+
+    def get_log_prob(self):
+        add_node_log_p = torch.cat(self.add_node_agent.log_prob).sum()
+        add_edge_log_p = torch.cat(self.add_edge_agent.log_prob).sum()
+        choose_dest_log_p = torch.cat(self.choose_dest_agent.log_prob).sum()
+        return add_node_log_p + add_edge_log_p + choose_dest_log_p
 #######################################################################################
 # Below is an animation where a graph is generated on the fly
 # after every 10 batches of training for the first 400 batches. One
@@ -725,6 +798,7 @@ def create_test_model():
     # Download a pre-trained model state dict for generating cycles with 10-20 nodes.
     state_dict = model_zoo.load_url('https://s3.us-east-2.amazonaws.com/dgl.ai/model/dgmg_cycles-5a0c40be.pth')
     model = DGMG(v_max=20, node_hidden_size=16, num_prop_rounds=2)
+    logger.info("test.state_dict = " + str(state_dict))
     model.load_state_dict(state_dict)
     model.eval()
     return model
@@ -775,41 +849,42 @@ def test_model():
     print('Among 100 graphs generated, {}% are valid.'.format(num_valid))
 
 
-def get_state(v_max, node_hidden_size):
+def get_state(v_max, node_hidden_size, num_prop_rounds):
     state_dict = OrderedDict()
-    (v, h) = (v_max, node_hidden_size)
+    (v, h, r) = (v_max, node_hidden_size, num_prop_rounds)
     state_dict['graph_embed.node_gating.0.weight'] = ones([1, h])
     state_dict['graph_embed.node_gating.0.bias'] = zeros([1])
-    state_dict['graph_embed.node_to_graph.weight'] = ones(v)
-    state_dict['graph_embed.node_to_graph.bias'] = zeros(v)
+    state_dict['graph_embed.node_to_graph.weight'] = ones([r*h, h])
+    state_dict['graph_embed.node_to_graph.bias'] = zeros(r*h)
     for i in range(2):
-        state_dict['graph_prop.message_funcs.'+str(i)+'.weight'] = ones(v)
-        state_dict['graph_prop.message_funcs.'+str(i)+'.bias'] = zeros(v)
-        state_dict['graph_prop.node_update_funcs.'+str(i)+'.weight_ih'] =ones(v)
-        state_dict['graph_prop.node_update_funcs.'+str(i)+'.weight_hh'] =ones(v)
-        state_dict['graph_prop.node_update_funcs.'+str(i)+'.bias_ih'] = zeros(v)
-        state_dict['graph_prop.node_update_funcs.'+str(i)+'.bias_hh'] = zeros(v)
-    state_dict['add_node_agent.add_node.weight'] = ones(v)
-    state_dict['add_node_agent.add_node.bias'] = zeros(v)
-    state_dict['add_node_agent.node_type_embed.weight'] = ones(v)
-    state_dict['add_node_agent.initialize_hv.weight'] = ones(v)
-    state_dict['add_node_agent.initialize_hv.bias'] = ones(v)
-    state_dict['add_edge_agent.add_edge.weight'] = ones(v)
-    state_dict['add_edge_agent.add_edge.bias'] = zeros(v)
-    state_dict['choose_dest_agent.choose_dest.weight'] = ones(v)
-    state_dict['choose_dest_agent.choose_dest.bias'] = zeros(v)
+        state_dict['graph_prop.message_funcs.'+str(i)+'.weight'] = ones([r*h,r*h+1])
+        state_dict['graph_prop.message_funcs.'+str(i)+'.bias'] = zeros(r*h)
+        state_dict['graph_prop.node_update_funcs.'+str(i)+'.weight_ih'] =ones([(1+r)*h, r*h])
+        state_dict['graph_prop.node_update_funcs.'+str(i)+'.weight_hh'] =ones([(1+r)*h, h])
+        state_dict['graph_prop.node_update_funcs.'+str(i)+'.bias_ih'] = zeros((1+r)*h)
+        state_dict['graph_prop.node_update_funcs.'+str(i)+'.bias_hh'] = zeros((1+r)*h)
+    state_dict['add_node_agent.add_node.weight'] = ones([1, r*h])
+    state_dict['add_node_agent.add_node.bias'] = zeros(1)
+    state_dict['add_node_agent.node_type_embed.weight'] = ones([1, h])
+    state_dict['add_node_agent.initialize_hv.weight'] = ones([h, (1+r)*h])
+    state_dict['add_node_agent.initialize_hv.bias'] = ones(h)
+    state_dict['add_edge_agent.add_edge.weight'] = ones([1,(1+r)*h])
+    state_dict['add_edge_agent.add_edge.bias'] = zeros(1)
+    state_dict['choose_dest_agent.choose_dest.weight'] = ones([1,r*h])
+    state_dict['choose_dest_agent.choose_dest.bias'] = zeros(1)
     logger.debug("state_dict = " + str(state_dict))
     return state_dict
 
 
-def generate_lqn():
-    model = DGMG(v_max=20, node_hidden_size=16, num_prop_rounds=2)
-    model.load_state_dict(get_state(20, 16))
+def generate_lqn(inputs, outputs):
+    model = DGLQN(v_max=20, node_hidden_size=16, num_prop_rounds=2, inputs=inputs, utilizations=outputs)
+    model.load_state_dict(get_state(20, 16, 2))
     model.eval()
     valids = []
-    for i in range(5):
+    for i in range(100):
         g = model()
         valids.append(is_valid(g))
+    del model
     logger.info("Valid LQNs = " + str(valids))
 
 
@@ -822,7 +897,7 @@ def usage():
     
 
 def process_args():
-    args = sys.argv[1:]
+    (args, params) = (sys.argv[1:], [])
     for i,j in zip(args, args[1:] + ['']):
         if i == "--verbose" or i == "-v":
             logger.setLevel(level=DEBUG)
@@ -832,13 +907,16 @@ def process_args():
         elif i == "--help" or i == "-h":
             usage()
             exit()
+        else:
+            params.append(i)
     if not len(args):
         usage()
         exit()
+    return (params[0:2], params[2:])
 
 
 
 if __name__ == "__main__":
-    process_args()
-    generate_lqn()
+    (inputs, outputs) = process_args()
+    generate_lqn(inputs, outputs)
     print("Output in " + sys.argv[0].replace("py", "log"))
