@@ -327,7 +327,7 @@ import torch
 
 
 class GraphEmbed(nn.Module):
-    def __init__(self, node_hidden_size, inputs=[0,0.001], utilizations=[]):
+    def __init__(self, node_hidden_size, inputs=[0.001,[]], utilizations=[]):
         super(GraphEmbed, self).__init__()
 
         # Setting from the paper
@@ -340,9 +340,11 @@ class GraphEmbed(nn.Module):
         )
         self.node_to_graph = nn.Linear(node_hidden_size,
                                        self.graph_hidden_size)
-        self.arrival_rate = inputs[0]
-        self.R = inputs[1]
-        self.utilizations = utilizations
+        deflist = lambda l : l if len(l) else [1]
+        self.arrival_rates = [float(i) for i in deflist(inputs[1])]
+        self.R = float(inputs[0])
+        self.utilizations = [float(u) for u in deflist(utilizations)] 
+        self.uid = 0
 
     def forward(self, g):
         if g.number_of_nodes() == 0:
@@ -475,6 +477,26 @@ class GraphProp(nn.Module):
 import torch.nn.functional as F
 from torch.distributions import Bernoulli
 
+
+def node_lqn_state(g_embed, g):
+    uid = g_embed.uid
+    (arrival_rate, demand) = (g_embed.arrival_rates[uid], g_embed.R) 
+    if (g.number_of_nodes() == 0):
+        utilization = arrival_rate * demand
+        error = utilization - g_embed.utilizations[uid]
+    else:
+        preds = g.predecessors(g.number_of_nodes() - 1)
+        if (len(preds)):
+            hv = g.nodes[preds[0]].data['hv']
+            putil = hv[0] * hv[1]
+            delta = (g_embed.R if hv[2] > putil else -g_embed.R) * 0.5
+            delta = delta if hv[2] != putil else 0
+            demand = (putil + delta) / arrival_rate
+        error = arrival_rate * demand - g_embed.utilizations[uid]
+    target = g_embed.utilizations[uid]
+    return (torch.DoubleTensor([demand, arrival_rate, target]), error)
+
+
 def bernoulli_action_log_prob(logit, action):
     """Calculate the log p of an action with respect to a Bernoulli
     distribution. Use logit rather than prob for numerical stability."""
@@ -499,14 +521,17 @@ class AddNode(nn.Module):
                                        node_hidden_size)
 
         self.init_node_activation = torch.zeros(1, 2 * node_hidden_size)
+        self.uid = -1
 
     def _initialize_node_repr(self, g, node_type, graph_embed):
         """Whenver a node is added, initialize its representation."""
         num_nodes = g.number_of_nodes()
+        print("init.dim = " + str(self.node_type_embed(torch.LongTensor([node_type])).size()) + ", " + str(node_type))
         hv_init = self.initialize_hv(
             torch.cat([
                 self.node_type_embed(torch.LongTensor([node_type])),
                 graph_embed], dim=1))
+        #hv_init = self.initializa_hv(node_lqn_state(graph_embed, g))
         g.nodes[num_nodes - 1].data['hv'] = hv_init
         g.nodes[num_nodes - 1].data['a'] = self.init_node_activation
 
@@ -514,20 +539,30 @@ class AddNode(nn.Module):
         self.log_prob = []
 
     def forward(self, g, action=None):
-        print("forward.graph_embed_fn = " + str(self.graph_op['embed'].arrival_rate))
+        print("forward.graph_embed_fn = " + str(self.graph_op['embed'].arrival_rates))
         graph_embed = self.graph_op['embed'](g)
 
         print("forward.graph_embed = " + str(graph_embed))
+        print("forward.g.num_nodes = " + str(g.number_of_nodes()))
+        #(hv, error) = node_lqn_state(self.graph_op['embed'])),
         logit = self.add_node(graph_embed)
         prob = torch.sigmoid(logit)
 
-        if not self.training:
-            action = Bernoulli(prob).sample().item()
+        #if not self.training:
+            #action = Bernoulli(prob).sample().item()
+        uid = self.graph_op['embed'].uid
+        utilization = self.graph_op['embed'].utilizations[uid]
+        demand = 0
+        error = utilization - self.graph_op['embed'].arrival_rates[uid] * demand
+        action = self.stop if error == 0 else 0
         stop = bool(action == self.stop)
 
         if not stop:
             g.add_nodes(1)
             self._initialize_node_repr(g, action, graph_embed)
+            #g.nodes[g.number_of_nodes()-1].uid = self.graph_op['embed'].uid
+        else:
+            self.graph_op['embed'].uid += 1
 
         if self.training:
             sample_log_prob = bernoulli_action_log_prob(logit, action)
@@ -838,7 +873,7 @@ def is_valid(g):
     return True
 
 
-def test_model():
+def run_test_model():
     model = create_test_model()
     num_valid = 0
     for i in range(100):
@@ -888,35 +923,56 @@ def generate_lqn(inputs, outputs):
     logger.info("Valid LQNs = " + str(valids))
 
 
+def train_lqn(inputs, outputs):
+    model = DGLQN(v_max=20, node_hidden_size=16, num_prop_rounds=2, inputs=inputs, utilizations=outputs)
+    model.load_state_dict(get_state(20, 16, 2))
+    model.eval()
+    valids = []
+    for i in range(100):
+        g = model()
+        valids.append(is_valid(g))
+    del model
+    logger.info("Valid LQNs = " + str(valids))
+
+
 def usage():
     print("\nUsage: " + sys.argv[0] + " [-v | -h] arrival-rate utilizations\n" +
         "\nGenerates LQN models using the specified inputs and outputs\n" +
         "\nOptional arguments:\n\n" +
         "-h, --help              Show this help message and exit\n" +
+        "-t, --train             Train LQN model using given parameters\n" +
+        "-e, --test              Run DGMG cyclic model tests\n" +
         "-v, --verbose           Verbose logging\n")
     
 
 def process_args():
-    (args, params) = (sys.argv[1:], [])
+    (args, params, train) = (sys.argv[1:], [], False)
     for i,j in zip(args, args[1:] + ['']):
         if i == "--verbose" or i == "-v":
             logger.setLevel(level=DEBUG)
-        if i == "--test" or i == "-t":
-            test_model()
+        elif i == "--train" or i == "-t":
+            train = True
+        elif i == "--test" or i == "-e":
+            run_test_model()
             exit()
         elif i == "--help" or i == "-h":
             usage()
             exit()
         else:
             params.append(i)
-    if not len(args):
+    if not len(args) or train and len(args) < 2: 
         usage()
         exit()
-    return (params[0:2], params[2:])
+    ids = range(len(params[1:]))
+    pairs = [j for i,j in zip(ids, zip(params[1:], params[2:])) if i%2==0]
+    return ([params[0], [i for i,j in pairs]], [j for i,j in pairs], train)
 
 
 
 if __name__ == "__main__":
-    (inputs, outputs) = process_args()
-    generate_lqn(inputs, outputs)
+    (inputs, outputs, train) = process_args()
+    if train:
+        train_lqn(inputs, outputs)
+    else:
+        generate_lqn(inputs, outputs)
     print("Output in " + sys.argv[0].replace("py", "log"))
