@@ -529,9 +529,10 @@ class AddNode(nn.Module):
         print("init.dim = " + str(self.node_type_embed(torch.LongTensor([node_type])).size()) + ", " + str(node_type))
         hv_init = self.initialize_hv(
             torch.cat([
-                self.node_type_embed(torch.LongTensor([node_type])),
+                self.node_type_embed(node_lqn_state(self.graph_op['embed'], g)[0]),
+                #self.node_type_embed(torch.LongTensor([node_type])),
                 graph_embed], dim=1))
-        #hv_init = self.initializa_hv(node_lqn_state(graph_embed, g))
+        #hv_init = self.initializa_hv(node_lqn_state(self.graph_op['embed'], g))
         g.nodes[num_nodes - 1].data['hv'] = hv_init
         g.nodes[num_nodes - 1].data['a'] = self.init_node_activation
 
@@ -544,7 +545,7 @@ class AddNode(nn.Module):
 
         print("forward.graph_embed = " + str(graph_embed))
         print("forward.g.num_nodes = " + str(g.number_of_nodes()))
-        #(hv, error) = node_lqn_state(self.graph_op['embed'])),
+        #(hv, error) = node_lqn_state(self.graph_op['embed'], g)),
         logit = self.add_node(graph_embed)
         prob = torch.sigmoid(logit)
 
